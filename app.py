@@ -152,15 +152,19 @@ st.markdown(
 # ============================================================================
 # DATA DIRECTORIES & DATA LOADERS (DYNAMIC)
 # ============================================================================
-DATA_DIR = "data"
-PLAYERS_FILE = os.path.join(DATA_DIR, "players.csv")
-RESULTS_FILE = os.path.join(DATA_DIR, "results.csv")
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+PLAYERS_FILE = "players.csv"
+RESULTS_FILE = "results.csv"
+
+def resolve_data_file(filename):
+    return os.path.join(APP_ROOT, filename)
 
 @st.cache_data
 def load_player_database():
     """Reads players CSV file and groups them dynamically by country"""
-    if os.path.exists(PLAYERS_FILE):
-        df = pd.read_csv(PLAYERS_FILE)
+    players_path = resolve_data_file(PLAYERS_FILE)
+    if os.path.exists(players_path):
+        df = pd.read_csv(players_path)
         db = {}
         for country, group in df.groupby("country"):
             db[country] = group.drop(columns=["country"]).to_dict(orient="records")
@@ -172,9 +176,10 @@ def load_player_database():
 @st.cache_data
 def load_prepared_kaggle_history():
     """Loads and formats the historical results file from Kaggle"""
-    if os.path.exists(RESULTS_FILE):
+    results_path = resolve_data_file(RESULTS_FILE)
+    if os.path.exists(results_path):
         try:
-            df = pd.read_csv(RESULTS_FILE)
+            df = pd.read_csv(results_path)
             if df.empty:
                 return pd.DataFrame()
             df['date'] = pd.to_datetime(df['date'])
@@ -188,7 +193,7 @@ def load_prepared_kaggle_history():
 
 # Initialize dynamic operational matrices
 PLAYER_DB = load_player_database()
-TEAMS = list(PLAYER_DB.keys()) if PLAYER_DB else ["No Data Found"]
+TEAMS = list(PLAYER_DB.keys()) if PLAYER_DB else []
 KAG_DF = load_prepared_kaggle_history()
 
 # ============================================================================
@@ -205,7 +210,7 @@ def compute_historical_team_metrics(df, team, current_date=None, window=10):
     if df.empty:
         return [1.2, 1.1, 0.45, 14]
         
-    if current_date is not None:
+    if current_date is not None and len(df) >= 10:
         past_games = df[((df['home_team'] == team) | (df['away_team'] == team)) & (df['date'] < current_date)]
     else:
         past_games = df[(df['home_team'] == team) | (df['away_team'] == team)]
@@ -262,26 +267,40 @@ def get_trained_model():
 PREDICTOR_MODEL = get_trained_model()
 
 def predict_match_outcome(home_team, away_team):
-    home_metrics = compute_historical_team_metrics(KAG_DF, home_team)
-    away_metrics = compute_historical_team_metrics(KAG_DF, away_team)
-    neutral_flag = [0]
+    # Calculate overalls to act as a dynamic fallback
+    h_overall = team_overall(home_team)
+    a_overall = team_overall(away_team)
     
-    live_match_vector = np.array([home_metrics + away_metrics + neutral_flag])
-    
-    if not KAG_DF.empty and len(KAG_DF) > 5:
-        model_probs = PREDICTOR_MODEL.predict_proba(live_match_vector)[0]
-        classes = list(PREDICTOR_MODEL.classes_)
-        
-        win_pct = round(float(model_probs[classes.index("Win")]) * 100)
-        draw_pct = round(float(model_probs[classes.index("Draw")]) * 100)
-        loss_pct = 100 - win_pct - draw_pct
+    if not KAG_DF.empty and len(KAG_DF) >= 2:
+        try:
+            home_metrics = compute_historical_team_metrics(KAG_DF, home_team)
+            away_metrics = compute_historical_team_metrics(KAG_DF, away_team)
+            neutral_flag = [0]
+            live_match_vector = np.array([home_metrics + away_metrics + neutral_flag])
+            
+            model_probs = PREDICTOR_MODEL.predict_proba(live_match_vector)[0]
+            classes = list(PREDICTOR_MODEL.classes_)
+            
+            win_pct = round(float(model_probs[classes.index("Win")]) * 100)
+            draw_pct = round(float(model_probs[classes.index("Draw")]) * 100)
+            loss_pct = 100 - win_pct - draw_pct
+        except Exception:
+            # Dynamic fallback based on player statistics if model breaks
+            total = h_overall + a_overall
+            win_pct = round((h_overall / total) * 100)
+            draw_pct = 20
+            loss_pct = 100 - win_pct - draw_pct
     else:
-        win_pct, draw_pct, loss_pct = 45, 25, 30
+        # Dynamic fallback based on player statistics
+        total = h_overall + a_overall
+        win_pct = round((h_overall / total) * 100)
+        draw_pct = 20
+        loss_pct = 100 - win_pct - draw_pct
 
     return {
         "win": win_pct, "draw": draw_pct, "loss": loss_pct,
-        "home_overall": round(team_overall(home_team), 1),
-        "away_overall": round(team_overall(away_team), 1),
+        "home_overall": round(h_overall, 1),
+        "away_overall": round(a_overall, 1),
     }
 
 # ============================================================================
@@ -297,13 +316,27 @@ def opponent_winger_pace(opponent_team):
 def fullback_score(player):
     return player["pace"] * 0.6 + player["def"] * 0.4
 
+POSITION_GROUPS = {
+    "GK": ("GK",),
+    "LB": ("LB", "RB", "CB"),
+    "RB": ("RB", "LB", "CB"),
+    "CB": ("CB", "LB", "RB"),
+    "CDM": ("CDM", "CM", "CAM"),
+    "CM": ("CM", "CDM", "CAM"),
+    "CAM": ("CAM", "CM", "CDM"),
+    "LW": ("LW", "RW", "ST"),
+    "RW": ("RW", "LW", "ST"),
+    "ST": ("ST", "LW", "RW"),
+}
+
 def pick_best_by(roster, pos, key, exclude=None):
-    candidates = [p for p in roster if p["pos"] == pos]
-    if exclude:
-        candidates = [p for p in candidates if p["name"] not in exclude]
+    exclude = exclude or []
+    candidates = [p for p in roster if p["pos"] == pos and p["name"] not in exclude]
     if not candidates:
-        # Fallback to general search if positions are blank in custom csv
-        candidates = [p for p in roster if p["name"] not in (exclude or [])]
+        group_positions = POSITION_GROUPS.get(pos, (pos,))
+        candidates = [p for p in roster if p["pos"] in group_positions and p["name"] not in exclude]
+    if not candidates:
+        candidates = [p for p in roster if p["name"] not in exclude]
     if not candidates: return {"name": f"Unknown {pos}", "pos": pos, "pace": 60, "def": 60, "ref": 60, "pas": 60}
     return sorted(candidates, key=key, reverse=True)[0]
 
@@ -422,23 +455,8 @@ def build_analysis_log(home_team, away_team, high_threat, threat_pace, rb, lb, p
     return log_items
 
 # ============================================================================
-# PATHWAY SIMULATION DATA
+# PATHWAY SIMULATION NARRATIVE
 # ============================================================================
-PATHWAY_TEMPLATE = {
-    "Brazil": [
-        {"round": "Round of 16", "opponent": "Uruguay", "win_pct": 68, "critical": False},
-        {"round": "Quarter-Final", "opponent": "Croatia", "win_pct": 62, "critical": False},
-        {"round": "Semi-Final", "opponent": "Germany", "win_pct": 40, "critical": True},
-        {"round": "Final", "opponent": "France", "win_pct": 55, "critical": False},
-    ],
-    "France": [
-        {"round": "Round of 16", "opponent": "Poland", "win_pct": 72, "critical": False},
-        {"round": "Quarter-Final", "opponent": "Morocco", "win_pct": 58, "critical": False},
-        {"round": "Semi-Final", "opponent": "Spain", "win_pct": 47, "critical": True},
-        {"round": "Final", "opponent": "Brazil", "win_pct": 45, "critical": False},
-    ]
-}
-
 def build_pathway_narrative(team, pathway):
     critical_fixture = next((f for f in pathway if f["critical"]), None)
     narrative = f"{team}'s predicted tournament pathway sees an optimized passage through early rounds against {pathway[0]['opponent']}. "
@@ -464,15 +482,15 @@ if view == "Tactical Support Assistant":
     st.sidebar.markdown("### Match Setup")
     tournament = st.sidebar.selectbox("Select Tournament", ["ACM Code Cup 2026"])
     
-    home_team = st.sidebar.selectbox("Choose Home Team", TEAMS, index=0 if len(TEAMS)>0 else 0)
+    home_team = st.sidebar.selectbox("Choose Home Team", TEAMS if TEAMS else ["No teams loaded"], index=0)
     away_options = [t for t in TEAMS if t != home_team]
     away_team = st.sidebar.selectbox("Choose Away Team", away_options if away_options else ["No Opponents Available"], index=0)
     
     generate = st.sidebar.button("Generate Tactics & Prediction", type="primary", use_container_width=True)
 
     if "tx_home" not in st.session_state:
-        st.session_state.tx_home = TEAMS[0] if len(TEAMS) > 0 else "Brazil"
-        st.session_state.tx_away = TEAMS[1] if len(TEAMS) > 1 else "France"
+        st.session_state.tx_home = TEAMS[0] if TEAMS else ""
+        st.session_state.tx_away = TEAMS[1] if len(TEAMS) > 1 else (TEAMS[0] if TEAMS else "")
 
     if generate and away_team != "No Opponents Available":
         st.session_state.tx_home = home_team
@@ -484,7 +502,7 @@ if view == "Tactical Support Assistant":
     st.title("TactixAI: Tactical Support Assistant")
     st.caption(f"{tournament} — {active_home} (Home) vs {active_away} (Away)")
 
-    if active_home in TEAMS and active_away in TEAMS:
+    if active_home in PLAYER_DB and active_away in PLAYER_DB:
         pred = predict_match_outcome(active_home, active_away)
         
         m1, m2, m3 = st.columns(3)
@@ -511,14 +529,14 @@ if view == "Tactical Support Assistant":
             log_html = "".join([f'<div class="tx-log-item">{item}</div>' for item in log_items])
             st.markdown(f'<div class="tx-card">{log_html}</div>', unsafe_allow_html=True)
     else:
-        st.warning("Please populate data profiles within 'data/players.csv' to unlock tactical simulations.")
+        st.warning(f"Please populate data profiles in '{PLAYERS_FILE}' to unlock tactical simulations.")
 
 # ============================================================================
 # MODULE 2: PATHWAY SIMULATION & BOTTLENECK ANALYSIS
 # ============================================================================
 else:
     st.sidebar.markdown("### Simulation Setup")
-    focus_team = st.sidebar.selectbox("Choose Focus Team", [t for t in TEAMS if t in PATHWAY_TEMPLATE], index=0 if [t for t in TEAMS if t in PATHWAY_TEMPLATE] else 0)
+    focus_team = st.sidebar.selectbox("Choose Focus Team", TEAMS, index=0 if len(TEAMS)>0 else 0)
     run_sim = st.sidebar.button("Run Pathway Simulation", type="primary", use_container_width=True)
 
     if "tx_focus" not in st.session_state:
@@ -530,9 +548,25 @@ else:
 
     st.title("TactixAI: Pathway Simulation & Bottleneck Analysis")
     
-    if active_focus in PATHWAY_TEMPLATE:
-        st.caption(f"Predicted Tournament Journey for {active_focus}")
-        pathway = PATHWAY_TEMPLATE[active_focus]
+    if active_focus in TEAMS:
+        st.caption(f"Predicted Dynamic Tournament Journey for {active_focus}")
+        
+        # Build dynamic rounds using other teams in your dropdown list
+        opponents = [t for t in TEAMS if t != active_focus]
+        if not opponents:
+            opponents = ["Uruguay", "Croatia", "Germany", "France"]
+        
+        rounds = ["Round of 16", "Quarter-Final", "Semi-Final", "Final"]
+        pathway = []
+        
+        for i, r in enumerate(rounds):
+            opp = opponents[i % len(opponents)]
+            pred = predict_match_outcome(active_focus, opp)
+            # Set critical bottleneck flag dynamically only if win prob is less than 50%
+            is_critical = pred["win"] < 50
+            pathway.append({
+                "round": r, "opponent": opp, "win_pct": pred["win"], "critical": is_critical
+            })
 
         cols = st.columns(len(pathway))
         for col, fixture in zip(cols, pathway):
@@ -550,5 +584,3 @@ else:
         st.write("")
         st.markdown("#### Pathway Narrative")
         st.markdown(f'<div class="tx-narrative-box">{build_pathway_narrative(active_focus, pathway)}</div>', unsafe_allow_html=True)
-    else:
-        st.info("Select a focus team (Brazil or France) to view the tournament simulation trees.")
