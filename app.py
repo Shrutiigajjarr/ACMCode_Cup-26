@@ -1,3 +1,4 @@
+from PIL.features import features
 import streamlit as st
 import numpy as np
 import pandas as pd
@@ -244,7 +245,8 @@ def build_model_training_set():
         return X_fake, y_fake
 
     features, targets = [], []
-    training_sample = KAG_DF.tail(800)
+    # Train using up to the latest 10,000 historical matches
+    training_sample = KAG_DF.tail(min(10000, len(KAG_DF)))
     
     for _, row in training_sample.iterrows():
         h_team, a_team, m_date = row['home_team'], row['away_team'], row['date']
@@ -252,7 +254,13 @@ def build_model_training_set():
         a_metrics = compute_historical_team_metrics(KAG_DF, a_team, m_date)
         neutral_flag = [1 if row['neutral'] else 0]
         
-        features.append(h_metrics + a_metrics + neutral_flag)
+        home_overall = team_overall(h_team)
+        away_overall = team_overall(a_team)
+
+        feature_vector = (h_metrics + a_metrics + [home_overall, away_overall] + neutral_flag
+    )
+
+        features.append(feature_vector)
         targets.append(row['outcome'])
         
     return np.array(features), np.array(targets)
@@ -260,9 +268,14 @@ def build_model_training_set():
 @st.cache_resource
 def get_trained_model():
     X, y = build_model_training_set()
-    model = RandomForestClassifier(n_estimators=100, max_depth=8, random_state=42)
-    model.fit(X, y)
-    return model
+    model = RandomForestClassifier(
+    n_estimators=300,
+    max_depth=15,
+    min_samples_split=5,
+    min_samples_leaf=2,
+    random_state=42,
+    n_jobs=-1
+)
 
 PREDICTOR_MODEL = get_trained_model()
 
@@ -276,7 +289,11 @@ def predict_match_outcome(home_team, away_team):
             home_metrics = compute_historical_team_metrics(KAG_DF, home_team)
             away_metrics = compute_historical_team_metrics(KAG_DF, away_team)
             neutral_flag = [0]
-            live_match_vector = np.array([home_metrics + away_metrics + neutral_flag])
+            home_overall = team_overall(home_team)
+            away_overall = team_overall(away_team)
+
+            live_match_vector = np.array([home_metrics + away_metrics + [home_overall, away_overall] + neutral_flag]
+            )
             
             model_probs = PREDICTOR_MODEL.predict_proba(live_match_vector)[0]
             classes = list(PREDICTOR_MODEL.classes_)
