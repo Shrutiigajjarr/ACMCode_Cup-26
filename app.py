@@ -158,7 +158,8 @@ PLAYERS_FILE = "players.csv"
 RESULTS_FILE = "results.csv"
 
 def resolve_data_file(filename):
-    return os.path.join(APP_ROOT, filename)
+    return os.path.join(APP_ROOT, "data", filename)
+
 
 @st.cache_data
 def load_player_database():
@@ -196,7 +197,10 @@ def load_prepared_kaggle_history():
 PLAYER_DB = load_player_database()
 TEAMS = list(PLAYER_DB.keys()) if PLAYER_DB else []
 KAG_DF = load_prepared_kaggle_history()
-
+st.write("APP_ROOT:", APP_ROOT)
+st.write("Data folder exists:", os.path.exists(os.path.join(APP_ROOT, "data")))
+st.write("Players file exists:", os.path.exists(os.path.join(APP_ROOT, "data", "players.csv")))
+st.write("Results file exists:", os.path.exists(os.path.join(APP_ROOT, "data", "results.csv")))
 # ============================================================================
 # PREDICTOR ENGINE (FEATURE ASSEMBLY UNIT)
 # ============================================================================
